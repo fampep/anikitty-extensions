@@ -1,3 +1,6 @@
+// Copyright 2026 fampep
+// Licensed under the Apache License, Version 2.0. See the LICENSE file.
+
 package site.anikitty.app.data.servers
 
 import android.content.Context

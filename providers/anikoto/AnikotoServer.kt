@@ -3,6 +3,7 @@
 
 package site.anikitty.app.data.servers
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -37,7 +38,7 @@ class AnikotoServer(
     override val server = StreamServer(
         id = ID,
         name = "Anikoto",
-        description = "Fast on-device URL resolve. Playback bandwidth stays on this phone.",
+        description = "Anikoto first, then kotoplay.to if Anikoto is down. Playback stays on this phone.",
         iconUrl = SITE_ICON_URL,
         siteUrl = ANIKOTO_BASE,
     )
@@ -51,6 +52,37 @@ class AnikotoServer(
         require(anilistId > 0) { "anilistId required" }
         require(episode > 0) { "episode required" }
         val mode = if (audio.equals("dub", ignoreCase = true)) "dub" else "sub"
+        if (hostAnswers(ANIKOTO_BASE)) {
+            val primary = try {
+                resolveAnikoto(anilistId, episode, audio, titleHint)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                null
+            }
+            if (!primary.isNullOrEmpty()) return@withContext primary
+        }
+        if (hostAnswers(KOTOPLAY_BASE)) {
+            val mirror = try {
+                resolveKotoplay(anilistId, episode, mode, titleHint)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                null
+            }
+            if (!mirror.isNullOrEmpty()) return@withContext mirror
+        }
+        error("No playable $mode sources")
+    }
+
+    /** anikoto.cz watch page, episode list, and MegaPlay embeds. */
+    private suspend fun resolveAnikoto(
+        anilistId: Int,
+        episode: Int,
+        audio: String,
+        titleHint: String?,
+    ): List<PlayableSource> = withContext(Dispatchers.IO) {
+        val mode = if (audio.equals("dub", ignoreCase = true)) "dub" else "sub"
         val (titles, malId) = hintParts(titleHint)
         val mapped = mapWatchPage(anilistId, titles, malId)
         val episodes = fetchEpisodes(mapped.siteId, mapped.watchUrl)
@@ -60,17 +92,50 @@ class AnikotoServer(
         if (mode != "dub" && !ep.hasSub) error("Sub unavailable for episode $episode")
         val referer = "${mapped.watchUrl.trimEnd('/')}/ep-$episode"
         val embeds = prioritizeEmbeds(resolveServerEmbeds(ep.ids, mode, mapped.watchUrl))
+        collectPlayable(embeds, referer, mode, anilistId, episode)
+    }
+
+    /**
+     * kotoplay.to is the same MegaPlay catalog under another front end.
+     * Search and the episode list use the /data routes. The embed URL is still MegaPlay,
+     * so subtitles, qualities, and seek sprites come from the same player.
+     */
+    private fun resolveKotoplay(
+        anilistId: Int,
+        episode: Int,
+        mode: String,
+        titleHint: String?,
+    ): List<PlayableSource> {
+        val (titles, malId) = hintParts(titleHint)
+        val show = mapKotoplay(anilistId, titles, malId)
+        val ep = show.chapters.firstOrNull { it.number == episode }
+            ?: error("Episode $episode not found")
+        if (mode == "dub" && !ep.hasDub) error("Dub unavailable for episode $episode")
+        if (mode != "dub" && !ep.hasSub) error("Sub unavailable for episode $episode")
+        val referer = "$KOTOPLAY_BASE/watch/${show.slug}/$episode"
+        val body = fetchJson("$KOTOPLAY_BASE/data/servers?chapter=${ep.chapterId}", referer)
+        val links = parseKotoServerLinks(body, mode)
+        if (links.isEmpty()) error("Anikoto: no $mode servers on kotoplay")
+        val embeds = prioritizeEmbeds(
+            links.map { ServerEmbed(it.url, it.label, parseSkipData(it.skip)) },
+        )
+        return collectPlayable(embeds, referer, mode, anilistId, episode)
+    }
+
+    private fun collectPlayable(
+        embeds: List<ServerEmbed>,
+        referer: String,
+        mode: String,
+        anilistId: Int,
+        episode: Int,
+    ): List<PlayableSource> {
         val skip = embeds.firstOrNull { !it.skip.isEmpty }?.skip ?: SkipTimes()
         if (!skip.isEmpty) skipMemory[skipKey(anilistId, episode)] = skip
         val out = ArrayList<PlayableSource>()
         val seen = HashSet<String>()
-        // Collect every labeled quality we can (1080p / 720p / …) across embeds so
-        // the player quality sheet can list them all, with CDN fallbacks.
         var lastResolveError: String? = null
         for (embed in embeds.take(8)) {
-            val embedUrl = embed.url
-            val label = embed.label
-            runCatching { resolveEmbed(embedUrl, referer) }
+            runCatching { resolveEmbed(embed.url, referer) }
                 .onSuccess { resolved ->
                     if (!probeMaster(resolved.file, resolved.origin)) {
                         lastResolveError = "CDN refused ${resolved.file.take(64)}"
@@ -81,8 +146,8 @@ class AnikotoServer(
                         listOf(resolved.file to "Stream")
                     }) {
                         if (!url.startsWith("http") || !seen.add(url)) continue
-                        val shown = qualityLabel(label, quality)
-                        val fields = site.anikitty.app.data.servers.BuiltInSourceMeta.anikoto(shown, mode)
+                        val shown = qualityLabel(embed.label, quality)
+                        val fields = BuiltInSourceMeta.anikoto(shown, mode)
                         out += PlayableSource(
                             url = url,
                             headers = streamHeaders(resolved.origin),
@@ -93,17 +158,71 @@ class AnikotoServer(
                             quality = fields.quality,
                             audio = fields.audio,
                             qualityRating = fields.qualityRating,
+                            thumbnails = resolved.thumbnails,
                         )
                     }
                 }
                 .onFailure { lastResolveError = it.message }
             if (out.size >= 16) break
         }
-        if (out.isEmpty()) {
-            error(lastResolveError ?: "No playable $mode sources")
+        if (out.isEmpty()) error(lastResolveError ?: "No playable $mode sources")
+        return out.sortedByDescending { qualityHeight(it.label) }
+    }
+
+    /** True when the host answers at all. A dead connection skips that front end. */
+    private fun hostAnswers(base: String): Boolean = runCatching {
+        val req = Request.Builder()
+            .url(base)
+            .header("User-Agent", CHROME_UA)
+            .header("Accept", "text/html,application/json")
+            .get()
+            .build()
+        http.newCall(req).execute().use { it.code < 500 }
+    }.getOrDefault(false)
+
+    private fun mapKotoplay(anilistId: Int, titles: List<String>, malId: Int?): KotoShow {
+        val hits = ArrayList<KotoHit>()
+        for (q in titles.take(6)) {
+            val data = runCatching {
+                fetchJson("$KOTOPLAY_BASE/data/suggest?q=${enc(q)}", "$KOTOPLAY_BASE/")
+            }.getOrElse { error ->
+                if (error is CancellationException) throw error
+                return@getOrElse null
+            } ?: continue
+            hits += parseKotoSuggest(data)
         }
-        // Highest resolution first so 1080p (when present) is the default pick.
-        out.sortedByDescending { qualityHeight(it.label) }
+        val ranked = rankKotoHits(hits, anilistId, titles, malId)
+        if (ranked.isEmpty()) error("No watch page for AniList $anilistId")
+        for (hit in ranked.take(8)) {
+            val page = try {
+                fetchJson(
+                    "$KOTOPLAY_BASE/data/anime?slug=${enc(hit.slug)}",
+                    "$KOTOPLAY_BASE/anime/${hit.slug}",
+                )
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                continue
+            }
+            val anime = kotoAnimeObject(page) ?: continue
+            val chapters = kotoChaptersIfMatch(anime, anilistId, malId) ?: continue
+            return KotoShow(hit.slug, chapters)
+        }
+        error("No watch page for AniList $anilistId")
+    }
+
+    private fun kotoplaySkip(anilistId: Int, episode: Int, titleHint: String?): SkipTimes {
+        val (titles, malId) = hintParts(titleHint)
+        val show = mapKotoplay(anilistId, titles, malId)
+        val ep = show.chapters.firstOrNull { it.number == episode } ?: return SkipTimes()
+        val referer = "$KOTOPLAY_BASE/watch/${show.slug}/$episode"
+        val body = fetchJson("$KOTOPLAY_BASE/data/servers?chapter=${ep.chapterId}", referer)
+        val links = parseKotoServerLinks(body, "sub").ifEmpty { parseKotoServerLinks(body, "dub") }
+        for (link in links) {
+            val skip = parseSkipData(link.skip)
+            if (!skip.isEmpty) return skip
+        }
+        return SkipTimes()
     }
 
     /**
@@ -119,18 +238,38 @@ class AnikotoServer(
         if (anilistId <= 0 || episode <= 0) return@withContext SkipTimes()
         val key = skipKey(anilistId, episode)
         skipMemory[key]?.let { return@withContext it }
-        val found = try {
-            val (titles, malId) = hintParts(titleHint)
-            val mapped = mapWatchPage(anilistId, titles, malId)
-            val ep = fetchEpisodes(mapped.siteId, mapped.watchUrl)
-                .firstOrNull { it.number == episode }
-                ?: return@withContext SkipTimes()
-            fetchSkipData(ep.ids, mapped.watchUrl)
-        } catch (_: Exception) {
-            return@withContext SkipTimes()
+        val found = if (!hostAnswers(ANIKOTO_BASE)) {
+            SkipTimes()
+        } else {
+            try {
+                val (titles, malId) = hintParts(titleHint)
+                val mapped = mapWatchPage(anilistId, titles, malId)
+                val ep = fetchEpisodes(mapped.siteId, mapped.watchUrl)
+                    .firstOrNull { it.number == episode }
+                if (ep == null) SkipTimes() else fetchSkipData(ep.ids, mapped.watchUrl)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                SkipTimes()
+            }
         }
-        skipMemory[key] = found
-        found
+        if (!found.isEmpty) {
+            skipMemory[key] = found
+            return@withContext found
+        }
+        val mirror = if (!hostAnswers(KOTOPLAY_BASE)) {
+            SkipTimes()
+        } else {
+            try {
+                kotoplaySkip(anilistId, episode, titleHint)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                SkipTimes()
+            }
+        }
+        if (!mirror.isEmpty) skipMemory[key] = mirror
+        mirror
     }
 
     /** Cheap GET on the master playlist with MegaPlay referer — skip dead CDNs early. */
@@ -153,6 +292,7 @@ class AnikotoServer(
     }
 
     private data class MappedShow(val siteId: String, val watchUrl: String)
+    private data class KotoShow(val slug: String, val chapters: List<KotoChapter>)
     private data class SiteEpisode(
         val number: Int,
         val ids: String,
@@ -165,6 +305,7 @@ class AnikotoServer(
         val file: String,
         val labeled: List<Pair<String, String>>,
         val subtitles: List<SubtitleTrack>,
+        val thumbnails: ThumbnailTrack?,
     )
 
     private fun mapWatchPage(anilistId: Int, titles: List<String>, malId: Int?): MappedShow {
@@ -365,7 +506,31 @@ class AnikotoServer(
         val file = extractFile(srcJson) ?: error("MegaPlay file missing")
         val labeled = extractLabeled(srcJson).ifEmpty { listOf(file to "Stream") }
         val subs = extractSubtitles(srcJson)
-        return ResolvedEmbed(origin = origin, file = file, labeled = labeled, subtitles = subs)
+        val headers = streamHeaders(origin)
+        val thumbs = extractThumbnails(srcJson, headers)
+        return ResolvedEmbed(
+            origin = origin,
+            file = file,
+            labeled = labeled,
+            subtitles = subs,
+            thumbnails = thumbs,
+        )
+    }
+
+    private fun extractThumbnails(data: JSONObject, headers: Map<String, String>): ThumbnailTrack? {
+        fun from(obj: JSONObject): ThumbnailTrack? {
+            spriteTrack(thumbnailTrackFromJson(obj, headers))?.let { return it }
+            thumbnailTrackFromTracks(obj.optJSONArray("tracks"), headers)?.let { return it }
+            return null
+        }
+        from(data)?.let { return it }
+        val enc = data.optString("enc")
+        if (enc.isNotBlank()) {
+            val origin = data.optString("_anikittyOrigin").ifBlank { "https://megaplay.buzz" }
+            val decrypted = runCatching { crypto.decryptEnc(enc, origin) }.getOrNull()
+            if (decrypted != null) from(decrypted)?.let { return it }
+        }
+        return null
     }
 
     private fun extractSubtitles(data: JSONObject): List<SubtitleTrack> {
@@ -531,6 +696,7 @@ class AnikotoServer(
         const val ID = "anikoto"
 
         private const val ANIKOTO_BASE = "https://anikoto.cz"
+        private const val KOTOPLAY_BASE = "https://kotoplay.to"
         /** Official site favicon — shown in Extension Store / installed sources. */
         private const val SITE_ICON_URL =
             "https://www.google.com/s2/favicons?domain=anikoto.cz&sz=128"
@@ -841,5 +1007,165 @@ class AnikotoServer(
             }
             return prefer + rest
         }
+
+        internal fun parseKotoSuggest(data: JSONObject): List<KotoHit> {
+            val arr = data.optJSONArray("anime") ?: return emptyList()
+            val out = ArrayList<KotoHit>()
+            for (i in 0 until arr.length()) {
+                val row = arr.optJSONObject(i) ?: continue
+                val slug = row.optString("slug").trim()
+                val title = row.optString("title").trim()
+                if (slug.isEmpty() || title.isEmpty()) continue
+                out += KotoHit(
+                    slug = slug,
+                    title = title,
+                    aniId = row.optInt("ani_id", 0).takeIf { it > 0 },
+                    malId = row.optInt("mal_id", 0).takeIf { it > 0 },
+                )
+            }
+            return out
+        }
+
+        internal fun kotoAnimeObject(data: JSONObject): JSONObject? {
+            return when (val anime = data.opt("anime")) {
+                is JSONObject -> anime
+                is JSONArray -> anime.optJSONObject(0)
+                else -> if (data.has("slug") || data.has("chapters")) data else null
+            }
+        }
+
+        internal fun parseKotoChapters(anime: JSONObject): List<KotoChapter> {
+            val arr = anime.optJSONArray("chapters") ?: return emptyList()
+            val out = ArrayList<KotoChapter>()
+            for (i in 0 until arr.length()) {
+                val row = arr.optJSONObject(i) ?: continue
+                val number = row.optString("chapter_number").toIntOrNull()
+                    ?: row.optInt("chapter_number", 0)
+                val chapterId = row.optInt("id", 0)
+                if (number <= 0 || chapterId <= 0) continue
+                out += KotoChapter(
+                    number = number,
+                    chapterId = chapterId,
+                    hasSub = kotoFlag(row, "is_sub"),
+                    hasDub = kotoFlag(row, "is_dub"),
+                    malId = row.optInt("mal_id", 0).takeIf { it > 0 },
+                )
+            }
+            return out
+        }
+
+        internal fun parseKotoServerLinks(data: JSONObject, mode: String): List<KotoServerLink> {
+            val servers = data.optJSONObject("servers") ?: return emptyList()
+            val arr = servers.optJSONArray(mode) ?: return emptyList()
+            val out = ArrayList<KotoServerLink>()
+            for (i in 0 until arr.length()) {
+                val row = arr.optJSONObject(i) ?: continue
+                val url = row.optString("link").trim()
+                if (!url.startsWith("http")) continue
+                val label = row.optString("name").ifBlank { "Anikoto" }
+                out += KotoServerLink(url, label, row.optJSONObject("skip_data"))
+            }
+            return out
+        }
+
+        /**
+         * Prefer the AniList id. When AniList sent a MAL id, the row must carry
+         * that same id. A title match is only used when we have no MAL id.
+         * Several rows can pass; the page check walks them in this order.
+         */
+        internal fun rankKotoHits(
+            hits: List<KotoHit>,
+            anilistId: Int,
+            titles: List<String>,
+            malId: Int?,
+        ): List<KotoHit> {
+            val best = LinkedHashMap<String, Pair<KotoHit, Int>>()
+            for (hit in hits) {
+                val score = kotoHitScore(hit, anilistId, titles, malId) ?: continue
+                val prev = best[hit.slug]
+                if (prev == null || score > prev.second) best[hit.slug] = hit to score
+            }
+            return best.values.sortedByDescending { it.second }.map { it.first }
+        }
+
+        internal fun pickKotoHit(
+            hits: List<KotoHit>,
+            anilistId: Int,
+            titles: List<String>,
+            malId: Int?,
+        ): KotoHit? = rankKotoHits(hits, anilistId, titles, malId).firstOrNull()
+
+        /**
+         * Null when this anime page is a different work. Empty chapters are a
+         * miss too, so the caller can open the next suggest row.
+         */
+        internal fun kotoChaptersIfMatch(
+            anime: JSONObject,
+            anilistId: Int,
+            malId: Int?,
+        ): List<KotoChapter>? {
+            val listedAni = anime.optInt("ani_id", 0)
+            if (listedAni > 0 && listedAni != anilistId) return null
+            val listedMal = anime.optInt("mal_id", 0)
+            if (malId != null && malId > 0 && listedMal > 0 && listedMal != malId) return null
+            val chapters = parseKotoChapters(anime)
+            if (chapters.isEmpty()) return null
+            if (malId != null && malId > 0) {
+                val chapterMals = chapters.mapNotNull { it.malId }.filter { it > 0 }.toSet()
+                if (chapterMals.isNotEmpty() && malId !in chapterMals) return null
+            }
+            return chapters
+        }
+
+        private fun kotoHitScore(
+            hit: KotoHit,
+            anilistId: Int,
+            titles: List<String>,
+            malId: Int?,
+        ): Int? {
+            if (hit.aniId != null && hit.aniId != anilistId) return null
+            val malKnown = malId != null && malId > 0
+            if (hit.aniId == anilistId) {
+                if (malKnown && hit.malId != null && hit.malId != malId) return null
+                return 300
+            }
+            if (malKnown) {
+                return if (hit.malId == malId) 200 else null
+            }
+            return if (titlesIdentifySameWork(hit.title, titles)) 100 else null
+        }
+
+        private fun kotoFlag(row: JSONObject, key: String): Boolean {
+            if (!row.has(key) || row.isNull(key)) return true
+            return when (val value = row.opt(key)) {
+                is Boolean -> value
+                is Number -> value.toInt() != 0
+                else -> {
+                    val text = row.optString(key)
+                    text == "1" || text.equals("true", ignoreCase = true)
+                }
+            }
+        }
     }
 }
+
+internal data class KotoHit(
+    val slug: String,
+    val title: String,
+    val aniId: Int?,
+    val malId: Int?,
+)
+
+internal data class KotoChapter(
+    val number: Int,
+    val chapterId: Int,
+    val hasSub: Boolean,
+    val hasDub: Boolean,
+    val malId: Int? = null,
+)
+
+internal data class KotoServerLink(
+    val url: String,
+    val label: String,
+    val skip: JSONObject?,
+)
